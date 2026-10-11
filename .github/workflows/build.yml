@@ -1,0 +1,106 @@
+name: Build APK
+
+# Fluxo: o repositório guarda o .zip do projeto (CodeInjector*.zip na raiz) + este arquivo em .github/workflows/.
+# O workflow extrai o zip sozinho (aceita o conteúdo na raiz do zip ou dentro de uma pasta).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Versões FIXAS: mudar aqui e em app/build.gradle.kts (ndkVersion / cmake.version) ao mesmo tempo.
+  NDK_VERSION: "26.1.10909125"
+  CMAKE_VERSION: "3.22.1"
+  PLATFORM: "android-34"
+  BUILD_TOOLS: "34.0.0"
+  GRADLE_VERSION: "8.9"
+
+jobs:
+  # 1) Núcleo C++ no PC: testes + sanitizers. Falha aqui = nem chega a compilar o APK.
+  native-tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        san: ["", "thread", "address,undefined"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extrair o projeto do .zip
+        run: |
+          ZIP="$(ls -1 CodeInjector*.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || { echo "ERRO: nenhum .zip na raiz do repositório"; exit 1; }
+          echo "usando $ZIP"
+          rm -rf proj && mkdir proj && unzip -q "$ZIP" -d proj
+          S="$(find proj -maxdepth 3 -name settings.gradle.kts | head -n1)"
+          [ -n "$S" ] || { echo "ERRO: settings.gradle.kts não encontrado dentro de $ZIP"; exit 1; }
+          echo "PROJ=$(dirname "$S")" >> "$GITHUB_ENV"
+      - name: Configurar
+        run: >
+          cmake -S "$PROJ/app/src/main/cpp" -B build-host -DCI_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release "-DCI_SANITIZE=${{ matrix.san }}"
+      - name: Compilar
+        run: cmake --build build-host --parallel
+      - name: Testar
+        run: ctest --test-dir build-host --output-on-failure
+
+  # 2) APK com o motor nativo (arm64-v8a + armeabi-v7a), -O3 + ThinLTO.
+  android:
+    needs: native-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extrair o projeto do .zip
+        run: |
+          ZIP="$(ls -1 CodeInjector*.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || { echo "ERRO: nenhum .zip na raiz do repositório"; exit 1; }
+          echo "usando $ZIP"
+          rm -rf proj && mkdir proj && unzip -q "$ZIP" -d proj
+          S="$(find proj -maxdepth 3 -name settings.gradle.kts | head -n1)"
+          [ -n "$S" ] || { echo "ERRO: settings.gradle.kts não encontrado dentro de $ZIP"; exit 1; }
+          echo "PROJ=$(dirname "$S")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+
+      # Chaquopy usa este Python só para compilar .pyc (versão precisa ser 3.11)
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ""   # instalamos tudo explicitamente (versões fixas) no passo abaixo
+
+      - name: SDK / NDK / CMake fixados
+        run: |
+          sdkmanager --install \
+            "platforms;${PLATFORM}" "build-tools;${BUILD_TOOLS}" \
+            "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "${{ env.GRADLE_VERSION }}"
+          build-root-directory: ${{ env.PROJ }}
+
+      - name: Compilar APK
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CodeInjector-debug-apk
+          path: ${{ env.PROJ }}/app/build/outputs/apk/debug/*.apk
+
+      # .so com símbolos (o APK leva a versão strip) para simbolizar crashes nativos com ndk-stack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-symbols
+          path: ${{ env.PROJ }}/app/build/intermediates/cxx/**/obj/**/libcodeinjector_native.so
+          if-no-files-found: warn
