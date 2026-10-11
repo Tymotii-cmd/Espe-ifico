@@ -1,0 +1,149 @@
+name: Build LLVM for Android (clang + lld)
+
+# Compila clang e lld ESTÁTICOS para Android (arm64-v8a e armeabi-v7a), só com os backends AArch64/ARM.
+# Manual (workflow_dispatch). Demora horas; rode uma vez e reaproveite o resultado.
+# AINDA NÃO TESTADO: a 1ª execução pode exigir ajustes nas flags do CMake.
+on:
+  workflow_dispatch:
+    inputs:
+      llvm_tag:
+        description: "Tag do llvm-project"
+        default: "llvmorg-18.1.8"
+      publish:
+        description: "Publicar como Release deste repositório"
+        type: boolean
+        default: false
+
+env:
+  NDK_VERSION: "26.1.10909125"   # mesmo NDK do app
+  API: "26"
+
+jobs:
+  # Ferramentas nativas do PC (tablegen) exigidas por qualquer cross-build do LLVM.
+  host-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - run: git clone --depth 1 --branch "${{ inputs.llvm_tag }}" https://github.com/llvm/llvm-project.git
+      - name: Compilar tablegen
+        run: |
+          cmake -S llvm-project/llvm -B build-host -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF
+          ninja -C build-host llvm-tblgen clang-tblgen llvm-min-tblgen
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-tools
+          path: |
+            build-host/bin/llvm-tblgen
+            build-host/bin/clang-tblgen
+            build-host/bin/llvm-min-tblgen
+
+  android:
+    needs: host-tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a,   llvm_triple: aarch64-linux-android,   sysroot_triple: aarch64-linux-android }
+          - { abi: armeabi-v7a, llvm_triple: armv7a-linux-androideabi, sysroot_triple: arm-linux-androideabi }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extrair o projeto do .zip
+        run: |
+          ZIP="$(ls -1 CodeInjector*.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+          [ -n "$ZIP" ] || { echo "ERRO: nenhum .zip na raiz do repositório"; exit 1; }
+          echo "usando $ZIP"
+          rm -rf proj && mkdir proj && unzip -q "$ZIP" -d proj
+          S="$(find proj -maxdepth 3 -name settings.gradle.kts | head -n1)"
+          [ -n "$S" ] || { echo "ERRO: settings.gradle.kts não encontrado dentro de $ZIP"; exit 1; }
+          echo "PROJ=$(dirname "$S")" >> "$GITHUB_ENV"
+      - name: Liberar disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build cmake
+      - uses: android-actions/setup-android@v3
+        with: { packages: "" }
+      - name: NDK fixado
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}"
+          echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with: { name: host-tools, path: host-tools }
+      - run: chmod +x host-tools/*
+      - run: git clone --depth 1 --branch "${{ inputs.llvm_tag }}" https://github.com/llvm/llvm-project.git
+
+      - name: Configurar (cross-build)
+        run: |
+          TRIPLE="${{ matrix.llvm_triple }}${API}"
+          cmake -S llvm-project/llvm -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" -DANDROID_PLATFORM="android-${API}" -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM" \
+            -DLLVM_HOST_TRIPLE="$TRIPLE" -DLLVM_DEFAULT_TARGET_TRIPLE="$TRIPLE" \
+            -DLLVM_NATIVE_TOOL_DIR="$PWD/host-tools" -DCLANG_TABLEGEN="$PWD/host-tools/clang-tblgen" \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF -DLLVM_LINK_LLVM_DYLIB=OFF -DCLANG_LINK_CLANG_DYLIB=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_PLUGINS=OFF \
+            -DLLVM_ENABLE_ASSERTIONS=OFF -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_DOCS=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_DOCS=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1
+
+      - name: Compilar clang e lld (horas)
+        run: ninja -C build clang lld
+
+      - name: Conferir que é estático e extrair
+        run: |
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          D="out/jniLibs/${{ matrix.abi }}"; mkdir -p "$D"
+          cp -L build/bin/clang "$D/libclang.so"
+          cp -L build/bin/lld   "$D/liblld.so"
+          "$BIN/llvm-strip" --strip-unneeded "$D/libclang.so" "$D/liblld.so"
+          for f in "$D"/*.so; do
+            echo "== $f ($(stat -c %s "$f") bytes)"; "$BIN/llvm-readelf" -d "$f" | grep NEEDED || true
+            if "$BIN/llvm-readelf" -d "$f" | grep -q "libc++_shared"; then echo "ERRO: dependência dinâmica de libc++_shared"; exit 1; fi
+          done
+
+      - name: Pacote de sysroot + clang-resource
+        run: |
+          RES="$(echo build/lib/clang/*)"
+          RT="$(echo $NDK/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux)"
+          bash "$PROJ/tools/make_sysroot_pack.sh" "$NDK" "${{ matrix.sysroot_triple }}" "$RES" "out/sysroot-${{ matrix.abi }}.zip" "$RT"
+          (cd out && sha256sum sysroot-*.zip jniLibs/*/*.so > SHA256SUMS-${{ matrix.abi }}.txt && cat SHA256SUMS-${{ matrix.abi }}.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toolchain-${{ matrix.abi }}
+          path: out/
+
+  release:
+    if: ${{ inputs.publish }}
+    needs: android
+    runs-on: ubuntu-24.04
+    permissions: { contents: write }
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: "toolchain-*", path: dl, merge-multiple: true }
+      - name: Publicar
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          TAG="toolchain-${{ inputs.llvm_tag }}"
+          gh release create "$TAG" --repo "${{ github.repository }}" --title "$TAG" --notes "clang+lld para Android (estáticos)" || true
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber dl/sysroot-*.zip dl/SHA256SUMS-*.txt
+          for abi in arm64-v8a armeabi-v7a; do
+            cp "dl/jniLibs/$abi/libclang.so" "dl/libclang-$abi.so"; cp "dl/jniLibs/$abi/liblld.so" "dl/liblld-$abi.so"
+          done
+          gh release upload "$TAG" --repo "${{ github.repository }}" --clobber dl/libclang-*.so dl/liblld-*.so
